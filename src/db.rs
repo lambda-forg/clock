@@ -1,4 +1,5 @@
-use chrono::{NaiveDateTime, Utc};
+use chrono::{Datelike, Duration, NaiveDateTime, Utc};
+use chrono_tz::Europe::Zurich;
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Mutex;
@@ -22,6 +23,45 @@ pub struct LeaderboardEntry {
     pub total_minutes: i64,
 }
 
+#[derive(Debug)]
+pub struct ActivityEntry {
+    pub username: String,
+    pub activity: String,
+    pub total_minutes: i64,
+    pub session_count: i64,
+}
+
+#[derive(Debug)]
+pub struct WeeklySummary {
+    pub total_minutes: i64,
+    pub total_sessions: i64,
+    pub unique_workers: i64,
+    pub mvp: Option<(String, i64)>,
+    pub top_activity: Option<(String, i64)>,
+    pub longest_session: Option<(String, String, i64)>,
+    pub breakdown: Vec<ActivityEntry>,
+}
+
+pub fn now_ch() -> NaiveDateTime {
+    Utc::now().with_timezone(&Zurich).naive_local()
+}
+
+fn now_ch_str() -> String {
+    now_ch().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+pub fn swiss_week_label() -> String {
+    let now = Utc::now().with_timezone(&Zurich);
+    now.format("KW%V/%G").to_string()
+}
+
+fn monday_of_current_week() -> String {
+    let now = now_ch();
+    let wd = now.weekday().num_days_from_monday() as i64;
+    let monday = now.date() - Duration::days(wd);
+    monday.format("%Y-%m-%d 00:00:00").to_string()
+}
+
 impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
@@ -35,7 +75,6 @@ impl Db {
                 ended_at    TEXT,
                 minutes     INTEGER
             );
-
             CREATE TABLE IF NOT EXISTS weekly_archive (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     TEXT    NOT NULL,
@@ -43,54 +82,58 @@ impl Db {
                 week_label  TEXT    NOT NULL,
                 total_min   INTEGER NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS idx_sessions_user   ON sessions(user_id);
-            CREATE INDEX IF NOT EXISTS idx_sessions_ended   ON sessions(ended_at);
-            CREATE INDEX IF NOT EXISTS idx_archive_user     ON weekly_archive(user_id);",
+            CREATE TABLE IF NOT EXISTS activity_archive (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT    NOT NULL,
+                username    TEXT    NOT NULL,
+                week_label  TEXT    NOT NULL,
+                activity    TEXT    NOT NULL,
+                total_min   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sess_user   ON sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sess_end    ON sessions(ended_at);
+            CREATE INDEX IF NOT EXISTS idx_arch_user   ON weekly_archive(user_id);
+            CREATE INDEX IF NOT EXISTS idx_actarch_user ON activity_archive(user_id);",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Start a clock-in. Returns Err if already clocked in.
     pub fn clock_in(&self, user_id: &str, username: &str, activity: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let active: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sessions WHERE user_id = ?1 AND ended_at IS NULL",
+            "SELECT COUNT(*) > 0 FROM sessions WHERE user_id=?1 AND ended_at IS NULL",
             params![user_id],
             |r| r.get(0),
         )?;
         if active {
             anyhow::bail!("already clocked in");
         }
-        let now = Utc::now().naive_utc();
         conn.execute(
-            "INSERT INTO sessions (user_id, username, activity, started_at) VALUES (?1, ?2, ?3, ?4)",
-            params![user_id, username, activity, now.format("%Y-%m-%d %H:%M:%S").to_string()],
+            "INSERT INTO sessions (user_id,username,activity,started_at) VALUES (?1,?2,?3,?4)",
+            params![user_id, username, activity, now_ch_str()],
         )?;
         Ok(())
     }
 
-    /// Stop the active session. Returns minutes worked + activity name.
     pub fn clock_out(&self, user_id: &str) -> anyhow::Result<(i64, String)> {
         let conn = self.conn.lock().unwrap();
-        let session: Option<(i64, String, String)> = conn
+        let row: Option<(i64, String, String)> = conn
             .query_row(
-                "SELECT id, started_at, activity FROM sessions WHERE user_id = ?1 AND ended_at IS NULL",
+                "SELECT id,started_at,activity FROM sessions WHERE user_id=?1 AND ended_at IS NULL",
                 params![user_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .ok();
-
-        match session {
+        match row {
             Some((id, started_str, activity)) => {
                 let started = NaiveDateTime::parse_from_str(&started_str, "%Y-%m-%d %H:%M:%S")?;
-                let now = Utc::now().naive_utc();
+                let now = now_ch();
                 let minutes = (now - started).num_minutes();
                 conn.execute(
-                    "UPDATE sessions SET ended_at = ?1, minutes = ?2 WHERE id = ?3",
-                    params![now.format("%Y-%m-%d %H:%M:%S").to_string(), minutes, id],
+                    "UPDATE sessions SET ended_at=?1, minutes=?2 WHERE id=?3",
+                    params![now_ch_str(), minutes, id],
                 )?;
                 Ok((minutes, activity))
             }
@@ -98,46 +141,34 @@ impl Db {
         }
     }
 
-    /// Get active session for a user.
     pub fn active_session(&self, user_id: &str) -> anyhow::Result<Option<ActiveSession>> {
         let conn = self.conn.lock().unwrap();
-        let result = conn.query_row(
-            "SELECT id, user_id, username, activity, started_at FROM sessions WHERE user_id = ?1 AND ended_at IS NULL",
+        match conn.query_row(
+            "SELECT id,user_id,username,activity,started_at FROM sessions WHERE user_id=?1 AND ended_at IS NULL",
             params![user_id],
-            |r| {
-                Ok(ActiveSession {
-                    id: r.get(0)?,
-                    user_id: r.get(1)?,
-                    username: r.get(2)?,
-                    activity: r.get(3)?,
-                    started_at: NaiveDateTime::parse_from_str(
-                        &r.get::<_, String>(4)?,
-                        "%Y-%m-%d %H:%M:%S",
-                    )
-                    .unwrap(),
-                })
-            },
-        );
-        match result {
+            |r| Ok(ActiveSession {
+                id: r.get(0)?,
+                user_id: r.get(1)?,
+                username: r.get(2)?,
+                activity: r.get(3)?,
+                started_at: NaiveDateTime::parse_from_str(&r.get::<_,String>(4)?, "%Y-%m-%d %H:%M:%S").unwrap(),
+            }),
+        ) {
             Ok(s) => Ok(Some(s)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Weekly leaderboard: completed sessions this week (Mon-Sun).
     pub fn leaderboard_weekly(&self) -> anyhow::Result<Vec<LeaderboardEntry>> {
         let conn = self.conn.lock().unwrap();
+        let monday = monday_of_current_week();
         let mut stmt = conn.prepare(
-            "SELECT username, SUM(minutes) as total
-             FROM sessions
-             WHERE ended_at IS NOT NULL
-               AND started_at >= date('now', 'weekday 1', '-7 days')
-             GROUP BY user_id
-             ORDER BY total DESC
-             LIMIT 15",
+            "SELECT username, SUM(minutes) as total FROM sessions
+             WHERE ended_at IS NOT NULL AND started_at >= ?1
+             GROUP BY user_id ORDER BY total DESC LIMIT 15",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![monday], |r| {
             Ok(LeaderboardEntry {
                 username: r.get(0)?,
                 total_minutes: r.get(1)?,
@@ -146,18 +177,16 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// All-time leaderboard: all completed sessions + archived weeks.
     pub fn leaderboard_alltime(&self) -> anyhow::Result<Vec<LeaderboardEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT username, SUM(mins) as total FROM (
-                SELECT username, SUM(minutes) as mins FROM sessions
-                    WHERE ended_at IS NOT NULL
-                    GROUP BY user_id
+                SELECT user_id, username, SUM(minutes) as mins FROM sessions
+                    WHERE ended_at IS NOT NULL GROUP BY user_id
                 UNION ALL
-                SELECT username, SUM(total_min) as mins FROM weekly_archive
+                SELECT user_id, username, SUM(total_min) as mins FROM weekly_archive
                     GROUP BY user_id
-             ) GROUP BY username ORDER BY total DESC LIMIT 15",
+             ) GROUP BY user_id ORDER BY total DESC LIMIT 15",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(LeaderboardEntry {
@@ -168,27 +197,150 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Archive current week's data and clear sessions table.
     pub fn archive_week(&self, week_label: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Archive totals per user
         conn.execute(
-            "INSERT INTO weekly_archive (user_id, username, week_label, total_min)
-             SELECT user_id, username, ?1, SUM(minutes)
-             FROM sessions
-             WHERE ended_at IS NOT NULL
-             GROUP BY user_id",
+            "INSERT INTO weekly_archive (user_id,username,week_label,total_min)
+             SELECT user_id,username,?1,SUM(minutes) FROM sessions
+             WHERE ended_at IS NOT NULL GROUP BY user_id",
             params![week_label],
         )?;
-        // Force-close any open sessions
+        // Archive per-activity breakdown
+        conn.execute(
+            "INSERT INTO activity_archive (user_id,username,week_label,activity,total_min)
+             SELECT user_id,username,?1,activity,SUM(minutes) FROM sessions
+             WHERE ended_at IS NOT NULL GROUP BY user_id, activity",
+            params![week_label],
+        )?;
         conn.execute("DELETE FROM sessions WHERE ended_at IS NOT NULL", [])?;
         Ok(())
     }
 
-    /// Who is currently clocked in?
+    /// Activity breakdown for current week per user.
+    pub fn activity_breakdown_weekly(&self) -> anyhow::Result<Vec<ActivityEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let monday = monday_of_current_week();
+        let mut stmt = conn.prepare(
+            "SELECT username, activity, SUM(minutes) as total, COUNT(*) as sessions
+             FROM sessions
+             WHERE ended_at IS NOT NULL AND started_at >= ?1
+             GROUP BY user_id, activity
+             ORDER BY username ASC, total DESC",
+        )?;
+        let rows = stmt.query_map(params![monday], |r| {
+            Ok(ActivityEntry {
+                username: r.get(0)?,
+                activity: r.get(1)?,
+                total_minutes: r.get(2)?,
+                session_count: r.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Activity breakdown for all time (archived + current).
+    pub fn activity_breakdown_alltime(&self) -> anyhow::Result<Vec<ActivityEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT username, activity, SUM(mins) as total, SUM(cnt) as sessions FROM (
+                SELECT username, activity, SUM(minutes) as mins, COUNT(*) as cnt
+                    FROM sessions WHERE ended_at IS NOT NULL
+                    GROUP BY user_id, activity
+                UNION ALL
+                SELECT username, activity, SUM(total_min) as mins, 0 as cnt
+                    FROM activity_archive
+                    GROUP BY user_id, activity
+             ) GROUP BY username, activity ORDER BY username ASC, total DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ActivityEntry {
+                username: r.get(0)?,
+                activity: r.get(1)?,
+                total_minutes: r.get(2)?,
+                session_count: r.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Weekly summary data for the automated post.
+    pub fn weekly_summary(&self) -> anyhow::Result<WeeklySummary> {
+        let conn = self.conn.lock().unwrap();
+        let monday = monday_of_current_week();
+
+        // Total hours, total sessions, unique workers
+        let (total_min, total_sessions, unique_workers): (i64, i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(minutes),0), COUNT(*), COUNT(DISTINCT user_id)
+             FROM sessions WHERE ended_at IS NOT NULL AND started_at >= ?1",
+            params![monday],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+
+        // MVP (most minutes)
+        let mvp: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT username, SUM(minutes) as total FROM sessions
+             WHERE ended_at IS NOT NULL AND started_at >= ?1
+             GROUP BY user_id ORDER BY total DESC LIMIT 1",
+                params![monday],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        // Most popular activity
+        let top_activity: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT activity, SUM(minutes) as total FROM sessions
+             WHERE ended_at IS NOT NULL AND started_at >= ?1
+             GROUP BY activity ORDER BY total DESC LIMIT 1",
+                params![monday],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        // Longest single session
+        let longest_session: Option<(String, String, i64)> = conn
+            .query_row(
+                "SELECT username, activity, minutes FROM sessions
+             WHERE ended_at IS NOT NULL AND started_at >= ?1
+             ORDER BY minutes DESC LIMIT 1",
+                params![monday],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+
+        // Per-person breakdown
+        let mut stmt = conn.prepare(
+            "SELECT username, activity, SUM(minutes) as total
+             FROM sessions WHERE ended_at IS NOT NULL AND started_at >= ?1
+             GROUP BY user_id, activity ORDER BY username ASC, total DESC",
+        )?;
+        let rows = stmt.query_map(params![monday], |r| {
+            Ok(ActivityEntry {
+                username: r.get(0)?,
+                activity: r.get(1)?,
+                total_minutes: r.get(2)?,
+                session_count: 0,
+            })
+        })?;
+        let breakdown: Vec<ActivityEntry> = rows.filter_map(|r| r.ok()).collect();
+
+        Ok(WeeklySummary {
+            total_minutes: total_min,
+            total_sessions,
+            unique_workers,
+            mvp,
+            top_activity,
+            longest_session,
+            breakdown,
+        })
+    }
+
     pub fn who_is_working(&self) -> anyhow::Result<Vec<ActiveSession>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, user_id, username, activity, started_at FROM sessions WHERE ended_at IS NULL",
+            "SELECT id,user_id,username,activity,started_at FROM sessions WHERE ended_at IS NULL",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ActiveSession {

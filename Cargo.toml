@@ -8,5 +8,6 @@ serenity = { version = "0.12", features = ["client", "gateway", "model", "framew
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = "0.4"
+chrono-tz = "0.10"
 dotenv = "0.15"
 anyhow = "1"
