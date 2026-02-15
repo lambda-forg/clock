@@ -22,9 +22,30 @@ impl EventHandler for Handler {
         commands::handle_command(&ctx, &msg, &self.db).await;
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         println!("[clock] {} is online", ready.user.name);
+
+        if let Some(channel_id) = summary_channel_id() {
+            let embed = CreateEmbed::new()
+                .color(0x2ecc71)
+                .title("✅ ClockBot Online")
+                .description(format!(
+                    "Summary channel verified.\nWeekly reports will post here every Monday 00:00.",
+                ))
+                .footer(CreateEmbedFooter::new(
+                    db::now_ch().format("%d.%m.%Y %H:%M").to_string(),
+                ));
+            let _ = channel_id
+                .send_message(&ctx.http, CreateMessage::new().embed(embed))
+                .await;
+        }
     }
+}
+
+fn summary_channel_id() -> Option<ChannelId> {
+    env::var("SUMMARY_CHANNEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
 }
 
 #[tokio::main]
